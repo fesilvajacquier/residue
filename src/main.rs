@@ -57,7 +57,7 @@ fn parse_options() -> Options {
             "--list" => opts.list_only = true,
             "-h" | "--help" => {
                 println!(
-                    "server-monitor [--interval SECS] [--stale-after HOURS] [--code-dir DIR] [--list]"
+                    "residue [--interval SECS] [--stale-after HOURS] [--code-dir DIR] [--list]"
                 );
                 println!("  --code-dir  where repos live as DIR/<org>/<repo> (default $PGWT_CODE_DIR or ~/code)");
                 println!("  --list      print servers, strays and leftover worktrees as plain text and exit");

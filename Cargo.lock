@@ -1216,6 +1216,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "residue"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "nix 0.31.3",
+ "procfs",
+ "ratatui",
+]
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1289,16 +1299,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
-]
-
-[[package]]
-name = "server-monitor"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "nix 0.31.3",
- "procfs",
- "ratatui",
 ]
 
 [[package]]

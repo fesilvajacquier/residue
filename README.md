@@ -1,4 +1,4 @@
-# server-monitor
+# residue
 
 A lazygit-style TUI for the residue that agents and git worktrees leave behind: dev servers
 still listening after their worktree was deleted, stray processes in deleted directories, and
@@ -101,13 +101,13 @@ Every kill or removal asks for confirmation and lists the exact PIDs, paths and 
 
 ```sh
 cargo install --path .
-server-monitor
+residue
 ```
 
 Options:
 
 ```
-server-monitor [--interval SECS] [--stale-after HOURS] [--code-dir DIR] [--list]
+residue [--interval SECS] [--stale-after HOURS] [--code-dir DIR] [--list]
 ```
 
 `--code-dir` is where repositories live as `DIR/<org>/<repo>` (default `$PGWT_CODE_DIR` or

@@ -1,11 +1,11 @@
 [package]
-name = "server-monitor"
+name = "residue"
 version = "0.1.0"
 edition = "2021"
-description = "lazygit-style TUI to see and kill the dev servers running on this machine"
+description = "lazygit-style TUI for the residue agent worktrees leave behind: servers, strays, worktrees and their databases"
 
 [[bin]]
-name = "server-monitor"
+name = "residue"
 path = "src/main.rs"
 
 [dependencies]
