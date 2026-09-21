@@ -1,0 +1,19 @@
+[package]
+name = "server-monitor"
+version = "0.1.0"
+edition = "2021"
+description = "lazygit-style TUI to see and kill the dev servers running on this machine"
+
+[[bin]]
+name = "server-monitor"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.30"
+procfs = "0.18"
+nix = { version = "0.31", features = ["signal", "user"] }
+chrono = "0.4"
+
+[profile.release]
+strip = true
+lto = true
