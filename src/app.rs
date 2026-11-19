@@ -101,6 +101,7 @@ pub struct RemoveItem {
     pub prune_only: bool,
     pub branch: Option<String>,
     pub dbs: Vec<String>,
+    pub force: bool,
 }
 
 #[derive(Clone)]
@@ -638,12 +639,7 @@ impl App {
 
     fn request_clean_all(&mut self) {
         if self.panel == Panel::Worktrees {
-            let items: Vec<RemoveItem> = self
-                .visible_worktrees()
-                .into_iter()
-                .filter(|w| w.verdict.is_safe() && w.hold.is_none())
-                .map(|w| self.remove_item(w))
-                .collect();
+            let items = self.safe_leftovers();
             if items.is_empty() {
                 self.notify("no provably safe leftovers in this panel");
                 return;
@@ -688,6 +684,14 @@ impl App {
         }));
     }
 
+    pub fn safe_leftovers(&self) -> Vec<RemoveItem> {
+        self.visible_worktrees()
+            .into_iter()
+            .filter(|w| w.verdict.is_safe() && w.hold.is_none())
+            .map(|w| self.remove_item(w, false))
+            .collect()
+    }
+
     fn request_remove(&mut self, force: bool) {
         if self.panel != Panel::Worktrees {
             self.notify("x removes worktrees: switch to panel 3");
@@ -716,7 +720,7 @@ impl App {
             ));
             return;
         }
-        let item = self.remove_item(wt);
+        let item = self.remove_item(wt, force);
         let title = format!(
             "{} {}",
             if force { "Force remove" } else { "Remove" },
@@ -728,7 +732,7 @@ impl App {
         }));
     }
 
-    fn remove_item(&self, wt: &Worktree) -> RemoveItem {
+    fn remove_item(&self, wt: &Worktree, force: bool) -> RemoveItem {
         let mut kill: Vec<Target> = self
             .servers_for(wt)
             .iter()
@@ -803,6 +807,7 @@ impl App {
             prune_only,
             branch,
             dbs,
+            force,
         }
     }
 
@@ -864,7 +869,7 @@ fn remove_all(items: Vec<RemoveItem>, progress: &Mutex<Progress>) {
         let result = if item.prune_only {
             worktree::prune_worktrees(&item.repo)
         } else {
-            worktree::remove_worktree(&item.repo, path)
+            worktree::remove_worktree(&item.repo, path, item.force)
         };
         match result {
             Ok(()) => {
@@ -906,6 +911,17 @@ fn remove_all(items: Vec<RemoveItem>, progress: &Mutex<Progress>) {
             Err(e) => p.errors.push(format!("{db}: {e}")),
         });
     });
+}
+
+pub fn remove_now(items: Vec<RemoveItem>) -> (String, Vec<String>) {
+    let progress = Mutex::new(Progress::default());
+    remove_all(items, &progress);
+    let p = progress.into_inner().unwrap_or_default();
+    let summary = removal_summary(&Progress {
+        errors: Vec::new(),
+        ..p
+    });
+    (summary, p.errors)
 }
 
 fn removal_summary(p: &Progress) -> String {

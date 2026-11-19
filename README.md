@@ -67,7 +67,7 @@ Worktree states:
 | `● tracking` | its branch still exists on the remote | needs `X` |
 | `!` | held: uncommitted changes (`X` overrides), locked, or the directory you launched from | blocked |
 
-Removing a worktree stops the processes running in it, runs `git worktree remove --force`,
+Removing a worktree stops the processes running in it, runs `git worktree remove` (with `--force` only for `X`, so a worktree that gained changes after the scan is refused),
 deletes the branch when it is merged, abandoned or its remote is gone, and drops its databases with `dropdb --force`.
 The confirmation lists every step and what would be lost. Removals run in the background with
 progress in the status bar; database drops run in parallel because each `DROP DATABASE` waits for
@@ -92,7 +92,7 @@ show as `?` until known.
 | `K` | servers and strays: stop every orphan · worktrees: clean every safe leftover |
 | `x` | worktree: stop its processes, remove it, drop its databases |
 | `X` | same, but also for dirty, local, gone or unstarted worktrees |
-| `f` | `git fetch --prune` every repo, so deleted remote branches show as gone |
+| `f` | `git fetch --prune` every repo with worktrees, so deleted remote branches show as gone |
 | `o` | show only problems: orphan and stale servers, leftover worktrees |
 | `s` | cycle server sort: port, status, age, mem, cpu |
 | `/` | filter by port, project, branch, dir, command or database name |
@@ -112,7 +112,7 @@ residue
 Options:
 
 ```
-residue [--interval SECS] [--stale-after HOURS] [--code-dir DIR] [--idle-after DAYS] [--list]
+residue [--interval SECS] [--stale-after HOURS] [--code-dir DIR] [--idle-after DAYS] [--list] [--clean [--dry-run]]
 ```
 
 `--code-dir` is where repositories live as `DIR/<org>/<repo>` (default `$PGWT_CODE_DIR` or
@@ -120,6 +120,16 @@ residue [--interval SECS] [--stale-after HOURS] [--code-dir DIR] [--idle-after D
 long a worktree with nothing of its own sits untouched before it counts as abandoned; it defaults
 to T3 Code's `sidebarAutoSettleAfterDays` from `~/.t3/userdata/settings.json`, or 15. `--list` prints the servers, strays and leftover worktrees as plain text and exits,
 which is handy from scripts or from an agent that wants to check for leftovers.
+
+`--clean` is `K` without the TUI: it fetches every repo, then removes every provably safe
+leftover across all of them (merged, abandoned, dir missing, db only; never anything held) and
+prints each step. Add `--dry-run` to see the plan without touching anything. It exits non-zero if
+any step failed, so it can run from cron:
+
+```cron
+PATH=/home/you/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+0 3 * * * residue --clean >> ~/.local/state/residue/clean.log 2>&1
+```
 
 ## Layout
 
