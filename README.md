@@ -69,7 +69,9 @@ Worktree states:
 
 Removing a worktree stops the processes running in it, runs `git worktree remove --force`,
 deletes the branch when it is merged, abandoned or its remote is gone, and drops its databases with `dropdb --force`.
-The confirmation lists every step and what would be lost.
+The confirmation lists every step and what would be lost. Removals run in the background with
+progress in the status bar; database drops run in parallel because each `DROP DATABASE` waits for
+a checkpoint, and concurrent drops share one.
 
 Everything about processes comes from `/proc`: listening sockets from `/proc/net/tcp{,6}`, socket
 owners from `/proc/<pid>/fd`, and the deleted-directory signal from the `(deleted)` suffix the

@@ -178,6 +178,8 @@ type MergedPrs = HashMap<String, Vec<String>>;
 
 const MERGED_PRS_TTL: Duration = Duration::from_secs(600);
 
+const SCAN_WORKERS: usize = 16;
+
 struct RawWorktree {
     path: PathBuf,
     head: String,
@@ -264,7 +266,7 @@ impl WorktreeScanner {
             Err(e) => (Vec::new(), Some(e)),
         };
         let repos = self.repos();
-        let contexts: Vec<(RepoContext, Vec<RawWorktree>)> = par_map(repos.clone(), |repo| {
+        let contexts: Vec<(RepoContext, Vec<RawWorktree>)> = par_map(repos.clone(), SCAN_WORKERS, |repo| {
             let list = list_worktrees(&repo);
             // A repo with only its main checkout has nothing to clean up; listing it is noise.
             let merged_prs = if list.len() > 1 {
@@ -289,7 +291,7 @@ impl WorktreeScanner {
             .flat_map(|(ctx, list)| list.iter().enumerate().map(move |(i, raw)| (ctx, i, raw)))
             .collect();
         let mut rows: Vec<Worktree> =
-            par_map(jobs, |(ctx, i, raw)| self.classify(ctx, i == 0, raw));
+            par_map(jobs, SCAN_WORKERS, |(ctx, i, raw)| self.classify(ctx, i == 0, raw));
         for row in &mut rows {
             let (mine, rest): (Vec<Db>, Vec<Db>) = dbs
                 .drain(..)
@@ -480,12 +482,12 @@ impl WorktreeScanner {
     }
 }
 
-fn par_map<T: Send, R: Send>(items: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get() * 2)
-        .unwrap_or(8)
-        .min(16)
-        .min(items.len().max(1));
+pub fn par_map<T: Send, R: Send>(
+    items: Vec<T>,
+    workers: usize,
+    f: impl Fn(T) -> R + Sync,
+) -> Vec<R> {
+    let workers = workers.min(items.len()).max(1);
     let queue = Mutex::new(items.into_iter().enumerate());
     let f = &f;
     let queue = &queue;
@@ -571,10 +573,12 @@ pub fn prune_worktrees(repo: &Path) -> Result<(), String> {
     git_checked(repo, &["worktree", "prune"])
 }
 
-pub fn delete_branch(repo: &Path, branch: &str) -> Result<(), String> {
+pub fn delete_branches(repo: &Path, branches: &[String]) -> Result<(), String> {
     // -D, not -d: a squash-merged branch is not an ancestor of the default branch, so -d would
     // reject exactly the branches that are safest to drop.
-    git_checked(repo, &["branch", "-D", branch])
+    let mut args = vec!["branch", "-D"];
+    args.extend(branches.iter().map(String::as_str));
+    git_checked(repo, &args)
 }
 
 pub fn drop_db(name: &str) -> Result<(), String> {

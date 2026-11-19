@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nix::sys::signal::{kill, Signal};
@@ -134,8 +136,30 @@ pub struct App {
     selected: [usize; 3],
     pub toast: Option<(String, Instant)>,
     pub should_quit: bool,
+    server_owner: Vec<Option<usize>>,
+    stray_owner: Vec<Option<usize>>,
+    removal: Option<Arc<Mutex<Progress>>>,
     refresh: Sender<()>,
     refresh_wt: Sender<WtCommand>,
+}
+
+#[derive(Default)]
+struct Progress {
+    total: usize,
+    done: usize,
+    removed: usize,
+    dropped: usize,
+    errors: Vec<String>,
+    finished: bool,
+}
+
+impl Progress {
+    fn step(progress: &Mutex<Progress>, apply: impl FnOnce(&mut Progress)) {
+        if let Ok(mut p) = progress.lock() {
+            p.done += 1;
+            apply(&mut p);
+        }
+    }
 }
 
 const TOAST_TTL: Duration = Duration::from_secs(4);
@@ -156,6 +180,9 @@ impl App {
             selected: [0, 0, 0],
             toast: None,
             should_quit: false,
+            server_owner: Vec::new(),
+            stray_owner: Vec::new(),
+            removal: None,
             refresh,
             refresh_wt,
         }
@@ -208,6 +235,24 @@ impl App {
     }
 
     pub fn tick(&mut self) {
+        if let Some(progress) = &self.removal {
+            let message = progress.lock().ok().map(|p| {
+                if p.finished {
+                    Err(removal_summary(&p))
+                } else {
+                    Ok(format!("cleaning… {}/{} steps", p.done, p.total))
+                }
+            });
+            match message {
+                Some(Ok(text)) => self.notify(&text),
+                Some(Err(text)) => {
+                    self.removal = None;
+                    self.refresh_all();
+                    self.notify(&text);
+                }
+                None => self.removal = None,
+            }
+        }
         if let Some((_, at)) = &self.toast {
             if at.elapsed() > TOAST_TTL {
                 self.toast = None;
@@ -306,36 +351,60 @@ impl App {
     /// The worktree a directory belongs to: the longest matching path wins, so a nested
     /// `.claude/worktrees/x` beats the main checkout that contains it.
     pub fn worktree_for(&self, cwd: Option<&Path>) -> Option<&Worktree> {
+        self.worktree_index_for(cwd)
+            .map(|i| &self.worktree_list()[i])
+    }
+
+    fn worktree_index_for(&self, cwd: Option<&Path>) -> Option<usize> {
         let cwd = cwd?;
         let rows = self.worktree_list();
         let by_path = rows
             .iter()
-            .filter(|w| w.path.is_some() && w.owns(Some(cwd)))
-            .max_by_key(|w| w.path.as_ref().map(|p| p.as_os_str().len()));
+            .enumerate()
+            .filter(|(_, w)| w.path.is_some() && w.owns(Some(cwd)))
+            .max_by_key(|(_, w)| w.path.as_ref().map(|p| p.as_os_str().len()))
+            .map(|(i, _)| i);
         by_path.or_else(|| {
             rows.iter()
-                .find(|w| w.verdict == Verdict::DeadDb && w.owns(Some(cwd)))
+                .position(|w| w.verdict == Verdict::DeadDb && w.owns(Some(cwd)))
         })
     }
 
     pub fn servers_for(&self, wt: &Worktree) -> Vec<&Server> {
         self.servers()
             .iter()
-            .filter(|s| self.owner_is(wt, s.root().cwd.as_deref()))
+            .zip(&self.server_owner)
+            .filter(|(_, owner)| self.is_row(**owner, wt))
+            .map(|(s, _)| s)
             .collect()
     }
 
     pub fn strays_for(&self, wt: &Worktree) -> Vec<&Stray> {
         self.strays()
             .iter()
-            .filter(|s| self.owner_is(wt, s.root.cwd.as_deref()))
+            .zip(&self.stray_owner)
+            .filter(|(_, owner)| self.is_row(**owner, wt))
+            .map(|(s, _)| s)
             .collect()
     }
 
-    fn owner_is(&self, wt: &Worktree, cwd: Option<&Path>) -> bool {
-        self.worktree_for(cwd)
-            .map(|w| w.repo_label == wt.repo_label && w.key == wt.key)
-            .unwrap_or(false)
+    fn is_row(&self, owner: Option<usize>, wt: &Worktree) -> bool {
+        owner
+            .and_then(|i| self.worktree_list().get(i))
+            .is_some_and(|w| std::ptr::eq(w, wt))
+    }
+
+    fn rebuild_owners(&mut self) {
+        self.server_owner = self
+            .servers()
+            .iter()
+            .map(|s| self.worktree_index_for(s.root().cwd.as_deref()))
+            .collect();
+        self.stray_owner = self
+            .strays()
+            .iter()
+            .map(|s| self.worktree_index_for(s.root.cwd.as_deref()))
+            .collect();
     }
 
     fn rebuild_rows(&mut self) {
@@ -402,6 +471,7 @@ impl App {
             })
             .map(|(i, _)| i)
             .collect();
+        self.rebuild_owners();
         self.clamp_selection();
     }
 
@@ -750,54 +820,27 @@ impl App {
     }
 
     fn execute_remove(&mut self, req: RemoveRequest) {
-        let mut removed = 0;
-        let mut dropped = 0;
-        let mut errors = Vec::new();
-        for item in &req.items {
-            send_signal(&item.kill, Signal::SIGTERM);
-            let result = match (&item.path, item.prune_only) {
-                (Some(_), true) => worktree::prune_worktrees(&item.repo),
-                (Some(p), false) => worktree::remove_worktree(&item.repo, p),
-                (None, _) => Ok(()),
-            };
-            match result {
-                Ok(()) => {
-                    if item.path.is_some() {
-                        removed += 1;
-                    }
-                    if let Some(b) = &item.branch {
-                        if let Err(e) = worktree::delete_branch(&item.repo, b) {
-                            errors.push(format!("{b}: {e}"));
-                        }
-                    }
-                }
-                Err(e) => {
-                    errors.push(format!("{}: {e}", item.summary.trim_end()));
-                    continue;
-                }
+        if self.removal.is_some() {
+            self.notify("a removal is still running");
+            return;
+        }
+        let total = req
+            .items
+            .iter()
+            .map(|i| usize::from(i.path.is_some()) + i.dbs.len())
+            .sum();
+        let progress = Arc::new(Mutex::new(Progress {
+            total,
+            ..Progress::default()
+        }));
+        self.removal = Some(Arc::clone(&progress));
+        self.notify(&format!("cleaning… 0/{total} steps"));
+        std::thread::spawn(move || {
+            remove_all(req.items, &progress);
+            if let Ok(mut p) = progress.lock() {
+                p.finished = true;
             }
-            for db in &item.dbs {
-                match worktree::drop_db(db) {
-                    Ok(()) => dropped += 1,
-                    Err(e) => errors.push(format!("{db}: {e}")),
-                }
-            }
-        }
-        self.refresh_all();
-        let mut done = Vec::new();
-        if removed > 0 {
-            done.push(format!("removed {removed} worktree(s)"));
-        }
-        if dropped > 0 {
-            done.push(format!("dropped {dropped} database(s)"));
-        }
-        if done.is_empty() {
-            done.push("nothing removed".to_string());
-        }
-        if !errors.is_empty() {
-            done.push(format!("failed: {}", errors.join("; ")));
-        }
-        self.notify(&done.join(", "));
+        });
     }
 
     fn refresh_all(&mut self) {
@@ -808,6 +851,81 @@ impl App {
     pub fn notify(&mut self, text: &str) {
         self.toast = Some((text.to_string(), Instant::now()));
     }
+}
+
+/// Each DROP DATABASE waits for a checkpoint; concurrent drops share one, so they run in parallel.
+fn remove_all(items: Vec<RemoveItem>, progress: &Mutex<Progress>) {
+    const WORKERS: usize = 16;
+    let (with_dir, db_only): (Vec<RemoveItem>, Vec<RemoveItem>) =
+        items.into_iter().partition(|i| i.path.is_some());
+    let removed: Vec<Option<RemoveItem>> = worktree::par_map(with_dir, WORKERS, |item| {
+        send_signal(&item.kill, Signal::SIGTERM);
+        let path = item.path.as_deref().unwrap_or(Path::new(""));
+        let result = if item.prune_only {
+            worktree::prune_worktrees(&item.repo)
+        } else {
+            worktree::remove_worktree(&item.repo, path)
+        };
+        match result {
+            Ok(()) => {
+                Progress::step(progress, |p| p.removed += 1);
+                Some(item)
+            }
+            Err(e) => {
+                let error = format!("{}: {e}", path.to_string_lossy());
+                Progress::step(progress, |p| {
+                    p.total -= item.dbs.len();
+                    p.errors.push(error);
+                });
+                None
+            }
+        }
+    });
+    let removed: Vec<RemoveItem> = removed.into_iter().flatten().collect();
+    let mut branches: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+    for item in &removed {
+        if let Some(b) = &item.branch {
+            branches.entry(item.repo.clone()).or_default().push(b.clone());
+        }
+    }
+    for (repo, names) in branches {
+        if let Err(e) = worktree::delete_branches(&repo, &names) {
+            if let Ok(mut p) = progress.lock() {
+                p.errors.push(format!("branches in {}: {e}", repo.to_string_lossy()));
+            }
+        }
+    }
+    for item in &db_only {
+        send_signal(&item.kill, Signal::SIGTERM);
+    }
+    let dbs: Vec<String> = removed.into_iter().chain(db_only).flat_map(|i| i.dbs).collect();
+    worktree::par_map(dbs, WORKERS, |db| {
+        let result = worktree::drop_db(&db);
+        Progress::step(progress, |p| match result {
+            Ok(()) => p.dropped += 1,
+            Err(e) => p.errors.push(format!("{db}: {e}")),
+        });
+    });
+}
+
+fn removal_summary(p: &Progress) -> String {
+    let mut done = Vec::new();
+    if p.removed > 0 {
+        done.push(format!("removed {} worktree(s)", p.removed));
+    }
+    if p.dropped > 0 {
+        done.push(format!("dropped {} database(s)", p.dropped));
+    }
+    if done.is_empty() {
+        done.push("nothing removed".to_string());
+    }
+    if !p.errors.is_empty() {
+        let shown: Vec<&str> = p.errors.iter().take(3).map(String::as_str).collect();
+        let more = p.errors.len().saturating_sub(shown.len());
+        let suffix = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+        done.push(format!("{} failed: {}{suffix}", p.errors.len(), shown.join("; ")));
+    }
+    done.join(", ")
 }
 
 fn send_signal(targets: &[Target], signal: Signal) -> (usize, Vec<String>) {
