@@ -301,17 +301,19 @@ impl WorktreeScanner {
             .collect();
         let mut rows: Vec<Worktree> =
             par_map(jobs, SCAN_WORKERS, |(ctx, i, raw)| self.classify(ctx, i == 0, raw));
-        for row in &mut rows {
-            let (mine, rest): (Vec<Db>, Vec<Db>) = dbs
-                .drain(..)
-                .partition(|db| db_suffix(&db.name) == Some(row.key.as_str()));
-            row.dbs = mine;
-            dbs = rest;
+        let mut by_key: HashMap<String, usize> = HashMap::new();
+        for (i, row) in rows.iter().enumerate() {
+            by_key.entry(row.key.clone()).or_insert(i);
         }
         let mut dead: BTreeMap<String, Vec<Db>> = BTreeMap::new();
-        for db in dbs {
-            if let Some(suffix) = db_suffix(&db.name) {
-                dead.entry(suffix.to_string()).or_default().push(db);
+        for db in dbs.drain(..) {
+            let Some(suffix) = db_suffix(&db.name) else { continue };
+            let owner = by_key
+                .get(suffix)
+                .or_else(|| shard_base(suffix).and_then(|base| by_key.get(base)));
+            match owner {
+                Some(&i) => rows[i].dbs.push(db),
+                None => dead.entry(suffix.to_string()).or_default().push(db),
             }
         }
         for (key, dbs) in dead {
@@ -745,6 +747,12 @@ fn db_suffix(name: &str) -> Option<&str> {
         Some((base, shard)) if !shard.is_empty() && shard.bytes().all(|b| b.is_ascii_digit()) => base,
         _ => suffix,
     })
+}
+
+/// Test shards are `<key>-N` or `<key>_N` depending on the app's parallel test setup.
+fn shard_base(suffix: &str) -> Option<&str> {
+    let (base, shard) = suffix.rsplit_once(['-', '_'])?;
+    (!shard.is_empty() && shard.bytes().all(|b| b.is_ascii_digit())).then_some(base)
 }
 
 fn label_from_db(name: &str) -> String {
