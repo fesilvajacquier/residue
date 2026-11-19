@@ -57,24 +57,27 @@ Worktree states:
 
 | State | Meaning | `x` |
 | --- | --- | --- |
-| `✓ merged` | remote branch deleted and every commit is in the default branch | removes |
+| `✓ merged` | its pull request was merged and the branch has nothing newer, or its remote branch was deleted and every commit is in the default branch | removes |
+| `✓ abandoned` | never pushed, no commits, changes or untracked files, and untouched for the idle threshold | removes |
 | `✗ dir missing` | git still lists the worktree but the directory is gone | prunes |
 | `✗ db only` | databases whose worktree no longer exists | drops them |
 | `? gone` | remote branch deleted but local commits are not in the default branch | needs `X` |
 | `● local` | never pushed, holds its own commits | needs `X` |
-| `· no commits` | never pushed, nothing of its own; a session may be working in it | needs `X` |
+| `· no commits` | never pushed, nothing committed; touched recently or holds untracked files | needs `X` |
 | `● tracking` | its branch still exists on the remote | needs `X` |
 | `!` | held: uncommitted changes (`X` overrides), locked, or the directory you launched from | blocked |
 
 Removing a worktree stops the processes running in it, runs `git worktree remove --force`,
-deletes the branch only when its remote is gone, and drops its databases with `dropdb --force`.
+deletes the branch when it is merged, abandoned or its remote is gone, and drops its databases with `dropdb --force`.
 The confirmation lists every step and what would be lost.
 
 Everything about processes comes from `/proc`: listening sockets from `/proc/net/tcp{,6}`, socket
 owners from `/proc/<pid>/fd`, and the deleted-directory signal from the `(deleted)` suffix the
 kernel puts on `/proc/<pid>/cwd`. Worktrees come from `git worktree list`, `git status` and
-`git rev-list`; databases from `psql` on the `postgres` database, matched by the `_wt_<name>`
-suffix that worktree setup hooks give them.
+`git rev-list`, checked in parallel; merged pull requests from `gh pr list --state merged`
+(cached for ten minutes, refreshed by `f`); databases from `psql` on the `postgres` database, matched by the `_wt_<name>`
+suffix that worktree setup hooks give them. Database sizes are measured in the background and
+show as `?` until known.
 
 ## Keys
 
@@ -107,11 +110,13 @@ residue
 Options:
 
 ```
-residue [--interval SECS] [--stale-after HOURS] [--code-dir DIR] [--list]
+residue [--interval SECS] [--stale-after HOURS] [--code-dir DIR] [--idle-after DAYS] [--list]
 ```
 
 `--code-dir` is where repositories live as `DIR/<org>/<repo>` (default `$PGWT_CODE_DIR` or
-`~/code`). `--list` prints the servers, strays and leftover worktrees as plain text and exits,
+`~/code`); repositories that are themselves linked worktrees are skipped. `--idle-after` is how
+long a worktree with nothing of its own sits untouched before it counts as abandoned; it defaults
+to T3 Code's `sidebarAutoSettleAfterDays` from `~/.t3/userdata/settings.json`, or 15. `--list` prints the servers, strays and leftover worktrees as plain text and exits,
 which is handy from scripts or from an agent that wants to check for leftovers.
 
 ## Layout

@@ -21,7 +21,27 @@ struct Options {
     interval: Duration,
     stale_after: Duration,
     code_dir: PathBuf,
+    idle_after: Duration,
     list_only: bool,
+}
+
+const DEFAULT_IDLE_DAYS: u64 = 15;
+
+fn t3_idle_days() -> Option<u64> {
+    let home = std::env::var("HOME").ok()?;
+    let settings =
+        std::fs::read_to_string(PathBuf::from(home).join(".t3/userdata/settings.json")).ok()?;
+    let (_, rest) = settings.split_once("\"sidebarAutoSettleAfterDays\"")?;
+    let digits: String = rest
+        .trim_start_matches(|c: char| c == ':' || c.is_whitespace())
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+fn days(n: u64) -> Duration {
+    Duration::from_secs(n * 24 * 3600)
 }
 
 fn default_code_dir() -> PathBuf {
@@ -36,6 +56,7 @@ fn parse_options() -> Options {
         interval: Duration::from_secs(2),
         stale_after: Duration::from_secs(24 * 3600),
         code_dir: default_code_dir(),
+        idle_after: days(t3_idle_days().unwrap_or(DEFAULT_IDLE_DAYS)),
         list_only: false,
     };
     let mut args = std::env::args().skip(1);
@@ -54,12 +75,17 @@ fn parse_options() -> Options {
                     opts.code_dir = PathBuf::from(dir);
                 }
             }
+            "--idle-after" => {
+                let n: u64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_IDLE_DAYS);
+                opts.idle_after = days(n);
+            }
             "--list" => opts.list_only = true,
             "-h" | "--help" => {
                 println!(
-                    "residue [--interval SECS] [--stale-after HOURS] [--code-dir DIR] [--list]"
+                    "residue [--interval SECS] [--stale-after HOURS] [--code-dir DIR] [--idle-after DAYS] [--list]"
                 );
                 println!("  --code-dir  where repos live as DIR/<org>/<repo> (default $PGWT_CODE_DIR or ~/code)");
+                println!("  --idle-after  days before a worktree with nothing of its own counts as abandoned (default: T3 Code's sidebarAutoSettleAfterDays, else {DEFAULT_IDLE_DAYS})");
                 println!("  --list      print servers, strays and leftover worktrees as plain text and exit");
                 std::process::exit(0);
             }
@@ -81,7 +107,7 @@ fn main() -> std::io::Result<()> {
     let opts = parse_options();
     if opts.list_only {
         print_list(&Scanner::new(opts.stale_after).scan());
-        print_worktrees(&WorktreeScanner::new(opts.code_dir).scan());
+        print_worktrees(&WorktreeScanner::new(opts.code_dir, opts.idle_after).scan());
         return Ok(());
     }
     let (tx, rx) = mpsc::channel();
@@ -102,7 +128,7 @@ fn main() -> std::io::Result<()> {
     });
 
     thread::spawn(move || {
-        let scanner = WorktreeScanner::new(opts.code_dir);
+        let scanner = WorktreeScanner::new(opts.code_dir, opts.idle_after);
         let mut note = None;
         loop {
             let mut snapshot = scanner.scan();
@@ -224,7 +250,7 @@ fn print_worktrees(snapshot: &worktree::WorktreeSnapshot) {
             if w.dbs.is_empty() {
                 "-".to_string()
             } else {
-                format::bytes(w.db_bytes())
+                format::maybe_bytes(w.db_bytes())
             },
             w.hold.map(|h| h.label()).unwrap_or(""),
         );
