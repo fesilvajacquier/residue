@@ -15,6 +15,10 @@ pub fn age(d: Duration) -> String {
     }
 }
 
+pub fn maybe_bytes(b: Option<u64>) -> String {
+    b.map(bytes).unwrap_or_else(|| "?".to_string())
+}
+
 pub fn bytes(b: u64) -> String {
     const K: f64 = 1024.0;
     let b = b as f64;

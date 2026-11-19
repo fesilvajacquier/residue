@@ -666,12 +666,12 @@ impl App {
             .collect();
         kill.extend(self.strays_for(wt).iter().map(|s| target(&s.root)));
         let prune_only = wt.verdict == Verdict::Missing;
-        // Only a branch whose remote is gone goes with the worktree; anything else may hold
-        // the only copy of its commits.
-        let branch = wt
-            .branch
-            .clone()
-            .filter(|_| wt.upstream_gone && (wt.ahead == 0 || wt.verdict == Verdict::Gone));
+        // Only a branch that holds nothing unmerged, or whose remote is gone, goes with the
+        // worktree; anything else may hold the only copy of its commits.
+        let branch = wt.branch.clone().filter(|_| {
+            matches!(wt.verdict, Verdict::Merged | Verdict::Abandoned)
+                || (wt.upstream_gone && wt.verdict == Verdict::Gone)
+        });
         let dbs: Vec<String> = wt.dbs.iter().map(|d| d.name.clone()).collect();
 
         let mut steps = Vec::new();
@@ -691,14 +691,14 @@ impl App {
             (None, _) => {}
         }
         for db in &wt.dbs {
-            steps.push(format!("drop database {} ({})", db.name, format::bytes(db.bytes)));
+            steps.push(format!("drop database {} ({})", db.name, format::maybe_bytes(db.bytes)));
         }
         let mut losses = Vec::new();
         if wt.hold == Some(worktree::Hold::Dirty) {
             losses.push("uncommitted changes".to_string());
         }
         if wt.untracked > 0 {
-            losses.push(format!("{} untracked file(s)", wt.untracked));
+            losses.push(format!("{} untracked path(s)", wt.untracked));
         }
         if wt.verdict == Verdict::Gone || wt.verdict == Verdict::Local {
             losses.push(format!("{} commit(s) not in the default branch", wt.ahead));
@@ -715,7 +715,7 @@ impl App {
             compact.push("branch".to_string());
         }
         if !dbs.is_empty() {
-            compact.push(format!("{} db(s) {}", dbs.len(), format::bytes(wt.db_bytes())));
+            compact.push(format!("{} db(s) {}", dbs.len(), format::maybe_bytes(wt.db_bytes())));
         }
         let summary = format!(
             "{:<34} {:<11} {}",

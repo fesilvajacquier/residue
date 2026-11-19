@@ -69,7 +69,7 @@ fn verdict_style(verdict: Verdict) -> Style {
         Verdict::Local => Style::new().fg(Color::Blue),
         Verdict::Unstarted => Style::new().fg(DIM),
         Verdict::Gone => Style::new().fg(Color::Yellow),
-        Verdict::Merged => Style::new().fg(Color::Yellow).bold(),
+        Verdict::Merged | Verdict::Abandoned => Style::new().fg(Color::Yellow).bold(),
         Verdict::Missing | Verdict::DeadDb => Style::new().fg(Color::Red).bold(),
     }
 }
@@ -176,7 +176,12 @@ fn draw_strays(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_worktrees(frame: &mut Frame, app: &App, area: Rect) {
     let worktrees = app.visible_worktrees();
     let (safe, check) = app.leftover_count();
-    let mut title = vec![Span::raw(format!(" [3] Worktrees ({}) ", worktrees.len()))];
+    let count = if app.worktrees.is_none() {
+        "scanning".to_string()
+    } else {
+        worktrees.len().to_string()
+    };
+    let mut title = vec![Span::raw(format!(" [3] Worktrees ({count}) "))];
     if safe > 0 {
         title.push(Span::styled(
             format!("✓{safe} "),
@@ -247,7 +252,7 @@ fn worktree_row<'a>(app: &'a App, w: &'a Worktree) -> Row<'a> {
     let db = if w.dbs.is_empty() {
         Span::styled("-", Style::new().fg(DIM))
     } else {
-        Span::raw(format::bytes(w.db_bytes()))
+        Span::raw(format::maybe_bytes(w.db_bytes()))
     };
     let age = w
         .age()
@@ -488,7 +493,9 @@ fn worktree_details<'a>(app: &'a App, w: &'a Worktree) -> Vec<Line<'a>> {
         )),
     }
     if let Some(b) = &w.branch {
-        let upstream = if w.upstream_gone {
+        let upstream = if w.pr_merged {
+            "  (pull request merged)"
+        } else if w.upstream_gone {
             "  (remote branch deleted)"
         } else if w.verdict == Verdict::Active {
             "  (tracks a live remote branch)"
@@ -520,8 +527,8 @@ fn worktree_details<'a>(app: &'a App, w: &'a Worktree) -> Vec<Line<'a>> {
         let changes = match (w.hold == Some(crate::worktree::Hold::Dirty), w.untracked) {
             (false, 0) => "clean".to_string(),
             (true, 0) => "uncommitted changes".to_string(),
-            (false, n) => format!("{n} untracked file(s)"),
-            (true, n) => format!("uncommitted changes, {n} untracked file(s)"),
+            (false, n) => format!("{n} untracked path(s)"),
+            (true, n) => format!("uncommitted changes, {n} untracked path(s)"),
         };
         lines.push(field("Changes", Span::raw(changes)));
     }
@@ -536,6 +543,17 @@ fn worktree_details<'a>(app: &'a App, w: &'a Worktree) -> Vec<Line<'a>> {
         ));
     }
 
+    if let Some(t) = w.touched {
+        let ago = std::time::SystemTime::now()
+            .duration_since(t)
+            .map(format::age)
+            .unwrap_or_default();
+        lines.push(field(
+            "Touched",
+            Span::raw(format!("{}  ({ago} ago)", format::timestamp(t))),
+        ));
+    }
+
     lines.push(Line::from(""));
     lines.push(heading("Databases"));
     if w.dbs.is_empty() {
@@ -544,7 +562,7 @@ fn worktree_details<'a>(app: &'a App, w: &'a Worktree) -> Vec<Line<'a>> {
     for db in &w.dbs {
         lines.push(Line::from(format!(
             "  {:>6}  {}",
-            format::bytes(db.bytes),
+            format::maybe_bytes(db.bytes),
             db.name
         )));
     }

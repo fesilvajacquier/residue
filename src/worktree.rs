@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -10,6 +12,7 @@ pub enum Verdict {
     Local,
     Unstarted,
     Gone,
+    Abandoned,
     Merged,
     Missing,
     DeadDb,
@@ -21,7 +24,7 @@ impl Verdict {
             Verdict::Main | Verdict::Active | Verdict::Local => "●",
             Verdict::Unstarted => "·",
             Verdict::Gone => "?",
-            Verdict::Merged => "✓",
+            Verdict::Merged | Verdict::Abandoned => "✓",
             Verdict::Missing | Verdict::DeadDb => "✗",
         }
     }
@@ -34,6 +37,7 @@ impl Verdict {
             Verdict::Unstarted => "no commits",
             Verdict::Gone => "gone",
             Verdict::Merged => "merged",
+            Verdict::Abandoned => "abandoned",
             Verdict::Missing => "dir missing",
             Verdict::DeadDb => "db only",
         }
@@ -46,7 +50,8 @@ impl Verdict {
             Verdict::Local => "never pushed and holds commits the default branch lacks",
             Verdict::Unstarted => "no commits of its own; a session may still be working in it",
             Verdict::Gone => "the remote branch was deleted but local commits are not in the default branch",
-            Verdict::Merged => "the remote branch was deleted and every commit is in the default branch",
+            Verdict::Merged => "its pull request was merged, or its remote branch was deleted with every commit in the default branch",
+            Verdict::Abandoned => "never pushed, nothing of its own, and untouched for longer than the idle threshold",
             Verdict::Missing => "git still lists it but the directory is gone",
             Verdict::DeadDb => "no worktree matches these databases any more",
         }
@@ -55,13 +60,20 @@ impl Verdict {
     pub fn is_leftover(self) -> bool {
         matches!(
             self,
-            Verdict::Gone | Verdict::Merged | Verdict::Missing | Verdict::DeadDb
+            Verdict::Gone
+                | Verdict::Merged
+                | Verdict::Abandoned
+                | Verdict::Missing
+                | Verdict::DeadDb
         )
     }
 
     /// Removable without an explicit force: nothing that exists only here would be lost.
     pub fn is_safe(self) -> bool {
-        matches!(self, Verdict::Merged | Verdict::Missing | Verdict::DeadDb)
+        matches!(
+            self,
+            Verdict::Merged | Verdict::Abandoned | Verdict::Missing | Verdict::DeadDb
+        )
     }
 }
 
@@ -89,7 +101,7 @@ impl Hold {
 #[derive(Clone, Debug)]
 pub struct Db {
     pub name: String,
-    pub bytes: u64,
+    pub bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -102,9 +114,11 @@ pub struct Worktree {
     pub verdict: Verdict,
     pub hold: Option<Hold>,
     pub upstream_gone: bool,
+    pub pr_merged: bool,
     pub ahead: usize,
     pub untracked: usize,
     pub last_commit: Option<SystemTime>,
+    pub touched: Option<SystemTime>,
     pub dbs: Vec<Db>,
 }
 
@@ -124,7 +138,7 @@ impl Worktree {
         format!("{}/{}", self.repo_label, self.dir_label())
     }
 
-    pub fn db_bytes(&self) -> u64 {
+    pub fn db_bytes(&self) -> Option<u64> {
         self.dbs.iter().map(|d| d.bytes).sum()
     }
 
@@ -154,7 +168,15 @@ pub struct WorktreeSnapshot {
 pub struct WorktreeScanner {
     code_dir: PathBuf,
     here: PathBuf,
+    idle_after: Duration,
+    merged_prs: Mutex<HashMap<PathBuf, (Instant, MergedPrs)>>,
+    db_sizes: Arc<Mutex<HashMap<String, u64>>>,
+    sizing: Arc<AtomicBool>,
 }
+
+type MergedPrs = HashMap<String, Vec<String>>;
+
+const MERGED_PRS_TTL: Duration = Duration::from_secs(600);
 
 struct RawWorktree {
     path: PathBuf,
@@ -163,12 +185,27 @@ struct RawWorktree {
     locked: bool,
 }
 
+struct RepoContext {
+    repo: PathBuf,
+    label: String,
+    default: String,
+    upstreams: HashMap<String, (bool, bool)>,
+    merged_prs: MergedPrs,
+}
+
 impl WorktreeScanner {
-    pub fn new(code_dir: PathBuf) -> Self {
+    pub fn new(code_dir: PathBuf, idle_after: Duration) -> Self {
         let here = std::env::current_dir()
             .and_then(|d| d.canonicalize())
             .unwrap_or_default();
-        Self { code_dir, here }
+        Self {
+            code_dir,
+            here,
+            idle_after,
+            merged_prs: Mutex::new(HashMap::new()),
+            db_sizes: Arc::new(Mutex::new(HashMap::new())),
+            sizing: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     pub fn repos(&self) -> Vec<PathBuf> {
@@ -181,7 +218,8 @@ impl WorktreeScanner {
                 continue;
             };
             for repo in repos.flatten() {
-                if repo.path().join(".git").exists() {
+                // A linked worktree has a .git file, not a directory; its repo is scanned already.
+                if repo.path().join(".git").is_dir() {
                     out.push(repo.path());
                 }
             }
@@ -209,6 +247,9 @@ impl WorktreeScanner {
                 }
             }
         }
+        if let Ok(mut cache) = self.merged_prs.lock() {
+            cache.clear();
+        }
         if failed.is_empty() {
             format!("fetched {} repos", repos.len())
         } else {
@@ -219,23 +260,36 @@ impl WorktreeScanner {
     pub fn scan(&self) -> WorktreeSnapshot {
         let started = Instant::now();
         let (mut dbs, db_error) = match worktree_dbs() {
-            Ok(dbs) => (dbs, None),
+            Ok(names) => (self.sized(names), None),
             Err(e) => (Vec::new(), Some(e)),
         };
         let repos = self.repos();
-        let mut rows: Vec<Worktree> = std::thread::scope(|scope| {
-            let handles: Vec<_> = repos
-                .iter()
-                .map(|r| scope.spawn(move || self.scan_repo(r)))
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap_or_default())
-                // A repo with only its main checkout has nothing to clean up; listing it is noise.
-                .filter(|per_repo| per_repo.len() > 1)
-                .flatten()
-                .collect()
-        });
+        let contexts: Vec<(RepoContext, Vec<RawWorktree>)> = par_map(repos.clone(), |repo| {
+            let list = list_worktrees(&repo);
+            // A repo with only its main checkout has nothing to clean up; listing it is noise.
+            let merged_prs = if list.len() > 1 {
+                self.merged_prs(&repo)
+            } else {
+                MergedPrs::new()
+            };
+            let context = RepoContext {
+                label: repo_label(&repo),
+                default: default_branch(&repo),
+                upstreams: upstream_state(&repo),
+                merged_prs,
+                repo,
+            };
+            (context, list)
+        })
+        .into_iter()
+        .filter(|(_, list)| list.len() > 1)
+        .collect();
+        let jobs: Vec<(&RepoContext, usize, &RawWorktree)> = contexts
+            .iter()
+            .flat_map(|(ctx, list)| list.iter().enumerate().map(move |(i, raw)| (ctx, i, raw)))
+            .collect();
+        let mut rows: Vec<Worktree> =
+            par_map(jobs, |(ctx, i, raw)| self.classify(ctx, i == 0, raw));
         for row in &mut rows {
             let (mine, rest): (Vec<Db>, Vec<Db>) = dbs
                 .drain(..)
@@ -259,9 +313,11 @@ impl WorktreeScanner {
                 verdict: Verdict::DeadDb,
                 hold: None,
                 upstream_gone: false,
+                pr_merged: false,
                 ahead: 0,
                 untracked: 0,
                 last_commit: None,
+                touched: None,
                 dbs,
             });
         }
@@ -280,84 +336,231 @@ impl WorktreeScanner {
         }
     }
 
-    fn scan_repo(&self, repo: &Path) -> Vec<Worktree> {
-        let label = repo_label(repo);
-        let default = default_branch(repo);
-        let upstreams = upstream_state(repo);
-        list_worktrees(repo)
+    /// Sizing thousands of databases takes minutes, so sizes fill in from a background thread.
+    fn sized(&self, names: Vec<String>) -> Vec<Db> {
+        let Ok(mut sizes) = self.db_sizes.lock() else {
+            return Vec::new();
+        };
+        let current: std::collections::HashSet<&String> = names.iter().collect();
+        sizes.retain(|name, _| current.contains(name));
+        let dbs: Vec<Db> = names
             .into_iter()
-            .enumerate()
-            .map(|(i, raw)| {
-                let is_main = i == 0;
-                let exists = raw.path.is_dir();
-                let (has_upstream, gone) = raw
-                    .branch
-                    .as_ref()
-                    .and_then(|b| upstreams.get(b))
-                    .copied()
-                    .unwrap_or((false, false));
-                let (dirty, untracked) = if exists && !is_main {
-                    status(&raw.path)
-                } else {
-                    (false, 0)
-                };
-                let reference = raw.branch.clone().unwrap_or_else(|| raw.head.clone());
-                // Unknown counts as "has commits": the safe direction is to keep it.
-                let ahead = if is_main {
-                    0
-                } else {
-                    git(repo, &["rev-list", "--count", &format!("{default}..{reference}")])
-                        .and_then(|s| s.trim().parse().ok())
-                        .unwrap_or(1)
-                };
-                let last_commit = git(repo, &["log", "-1", "--format=%ct", &reference])
-                    .and_then(|s| s.trim().parse::<u64>().ok())
-                    .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
-                let verdict = if is_main {
-                    Verdict::Main
-                } else if !exists {
-                    Verdict::Missing
-                } else if has_upstream && !gone {
-                    Verdict::Active
-                } else if gone {
-                    if ahead == 0 {
-                        Verdict::Merged
-                    } else {
-                        Verdict::Gone
-                    }
-                } else if ahead == 0 {
-                    Verdict::Unstarted
-                } else {
-                    Verdict::Local
-                };
-                let hold = if is_main {
-                    None
-                } else if raw.locked {
-                    Some(Hold::Locked)
-                } else if self.here.starts_with(&raw.path) {
-                    Some(Hold::Here)
-                } else if dirty {
-                    Some(Hold::Dirty)
-                } else {
-                    None
-                };
-                Worktree {
-                    repo: repo.to_path_buf(),
-                    repo_label: label.clone(),
-                    key: db_key(&raw.path),
-                    path: Some(raw.path),
-                    branch: raw.branch,
-                    verdict,
-                    hold,
-                    upstream_gone: gone,
-                    ahead,
-                    untracked,
-                    last_commit,
-                    dbs: Vec::new(),
-                }
+            .map(|name| Db {
+                bytes: sizes.get(&name).copied(),
+                name,
             })
-            .collect()
+            .collect();
+        let unsized_names: Vec<String> = dbs
+            .iter()
+            .filter(|d| d.bytes.is_none())
+            .map(|d| d.name.clone())
+            .collect();
+        if !unsized_names.is_empty() && !self.sizing.swap(true, Ordering::SeqCst) {
+            let cache = Arc::clone(&self.db_sizes);
+            let sizing = Arc::clone(&self.sizing);
+            std::thread::spawn(move || {
+                for chunk in unsized_names.chunks(100) {
+                    let Ok(measured) = measure_dbs(chunk) else { break };
+                    if let Ok(mut sizes) = cache.lock() {
+                        sizes.extend(measured);
+                    }
+                }
+                sizing.store(false, Ordering::SeqCst);
+            });
+        }
+        dbs
     }
+
+    fn merged_prs(&self, repo: &Path) -> MergedPrs {
+        if let Ok(cache) = self.merged_prs.lock() {
+            if let Some((at, prs)) = cache.get(repo) {
+                if at.elapsed() < MERGED_PRS_TTL {
+                    return prs.clone();
+                }
+            }
+        }
+        let prs = fetch_merged_prs(repo);
+        if let Ok(mut cache) = self.merged_prs.lock() {
+            cache.insert(repo.to_path_buf(), (Instant::now(), prs.clone()));
+        }
+        prs
+    }
+
+    fn classify(&self, ctx: &RepoContext, is_main: bool, raw: &RawWorktree) -> Worktree {
+        let repo = ctx.repo.as_path();
+        let exists = raw.path.is_dir();
+        let (has_upstream, gone) = raw
+            .branch
+            .as_ref()
+            .and_then(|b| ctx.upstreams.get(b))
+            .copied()
+            .unwrap_or((false, false));
+        let (dirty, untracked) = if exists && !is_main {
+            status(&raw.path)
+        } else {
+            (false, 0)
+        };
+        let reference = raw.branch.clone().unwrap_or_else(|| raw.head.clone());
+        // Unknown counts as "has commits": the safe direction is to keep it.
+        let ahead = if is_main {
+            0
+        } else {
+            git(repo, &["rev-list", "--count", &format!("{}..{reference}", ctx.default)])
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(1)
+        };
+        let pr_merged = !is_main
+            && ahead > 0
+            && raw
+                .branch
+                .as_ref()
+                .and_then(|b| ctx.merged_prs.get(b))
+                .is_some_and(|heads| heads.iter().any(|h| contains(repo, h, &raw.head)));
+        let last_commit = git(repo, &["log", "-1", "--format=%ct", &reference])
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
+        let touched = if exists && !is_main {
+            last_touched(&raw.path)
+        } else {
+            None
+        };
+        let idle = touched
+            .and_then(|t| SystemTime::now().duration_since(t).ok())
+            .is_some_and(|d| d >= self.idle_after);
+        let verdict = if is_main {
+            Verdict::Main
+        } else if !exists {
+            Verdict::Missing
+        } else if pr_merged {
+            Verdict::Merged
+        } else if has_upstream && !gone {
+            Verdict::Active
+        } else if gone {
+            if ahead == 0 {
+                Verdict::Merged
+            } else {
+                Verdict::Gone
+            }
+        } else if ahead == 0 {
+            if idle && !dirty && untracked == 0 {
+                Verdict::Abandoned
+            } else {
+                Verdict::Unstarted
+            }
+        } else {
+            Verdict::Local
+        };
+        let hold = if is_main {
+            None
+        } else if raw.locked {
+            Some(Hold::Locked)
+        } else if self.here.starts_with(&raw.path) {
+            Some(Hold::Here)
+        } else if dirty {
+            Some(Hold::Dirty)
+        } else {
+            None
+        };
+        Worktree {
+            repo: repo.to_path_buf(),
+            repo_label: ctx.label.clone(),
+            key: db_key(&raw.path),
+            path: Some(raw.path.clone()),
+            branch: raw.branch.clone(),
+            verdict,
+            hold,
+            upstream_gone: gone,
+            pr_merged,
+            ahead,
+            untracked,
+            last_commit,
+            touched,
+            dbs: Vec::new(),
+        }
+    }
+}
+
+fn par_map<T: Send, R: Send>(items: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get() * 2)
+        .unwrap_or(8)
+        .min(16)
+        .min(items.len().max(1));
+    let queue = Mutex::new(items.into_iter().enumerate());
+    let f = &f;
+    let queue = &queue;
+    let mut results: Vec<(usize, R)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(move || {
+                    let mut done = Vec::new();
+                    loop {
+                        let next = queue.lock().ok().and_then(|mut q| q.next());
+                        let Some((i, item)) = next else { break };
+                        done.push((i, f(item)));
+                    }
+                    done
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
+    results.sort_by_key(|(i, _)| *i);
+    results.into_iter().map(|(_, r)| r).collect()
+}
+
+fn fetch_merged_prs(repo: &Path) -> MergedPrs {
+    let mut prs = MergedPrs::new();
+    let Ok(out) = Command::new("gh")
+        .current_dir(repo)
+        .args([
+            "pr",
+            "list",
+            "--state",
+            "merged",
+            "--limit",
+            "1000",
+            "--json",
+            "headRefName,headRefOid",
+            "--template",
+            "{{range .}}{{.headRefName}}|{{.headRefOid}}\n{{end}}",
+        ])
+        .output()
+    else {
+        return prs;
+    };
+    if !out.status.success() {
+        return prs;
+    }
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some((branch, oid)) = line.split_once('|') {
+            prs.entry(branch.to_string()).or_default().push(oid.to_string());
+        }
+    }
+    prs
+}
+
+fn contains(repo: &Path, merged_head: &str, tip: &str) -> bool {
+    merged_head == tip || git(repo, &["merge-base", "--is-ancestor", tip, merged_head]).is_some()
+}
+
+/// Not the index: our own `git status` refreshes it, which would make every worktree look fresh.
+fn last_touched(path: &Path) -> Option<SystemTime> {
+    let mut candidates = vec![path.to_path_buf()];
+    if let Ok(link) = std::fs::read_to_string(path.join(".git")) {
+        if let Some(dir) = link.trim().strip_prefix("gitdir: ") {
+            let gitdir = path.join(dir);
+            candidates.push(gitdir.join("HEAD"));
+            candidates.push(gitdir.join("logs").join("HEAD"));
+        }
+    }
+    candidates
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+        .max()
 }
 
 pub fn remove_worktree(repo: &Path, path: &Path) -> Result<(), String> {
@@ -464,7 +667,7 @@ fn list_worktrees(repo: &Path) -> Vec<RawWorktree> {
 }
 
 fn status(path: &Path) -> (bool, usize) {
-    let out = git(path, &["status", "--porcelain", "--untracked-files=all"]).unwrap_or_default();
+    let out = git(path, &["-c", "core.untrackedCache=true", "status", "--porcelain", "--untracked-files=normal"]).unwrap_or_default();
     let mut dirty = false;
     let mut untracked = 0;
     for line in out.lines() {
@@ -477,33 +680,42 @@ fn status(path: &Path) -> (bool, usize) {
     (dirty, untracked)
 }
 
-fn worktree_dbs() -> Result<Vec<Db>, String> {
+fn worktree_dbs() -> Result<Vec<String>, String> {
+    Ok(psql(
+        "SELECT datname FROM pg_database \
+         WHERE NOT datistemplate AND datname LIKE '%\\_wt\\_%' ORDER BY datname",
+    )?
+    .lines()
+    .map(str::to_string)
+    .collect())
+}
+
+fn measure_dbs(names: &[String]) -> Result<Vec<(String, u64)>, String> {
+    let list = names
+        .iter()
+        .map(|n| format!("'{}'", n.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(psql(&format!(
+        "SELECT datname || '|' || pg_database_size(datname) FROM pg_database WHERE datname IN ({list})"
+    ))?
+    .lines()
+    .filter_map(|line| {
+        let (name, bytes) = line.split_once('|')?;
+        Some((name.to_string(), bytes.trim().parse().ok()?))
+    })
+    .collect())
+}
+
+fn psql(query: &str) -> Result<String, String> {
     let out = Command::new("psql")
-        .args([
-            "-X",
-            "-d",
-            "postgres",
-            "-tA",
-            "-F|",
-            "-c",
-            "SELECT datname, pg_database_size(datname) FROM pg_database \
-             WHERE NOT datistemplate AND datname LIKE '%\\_wt\\_%' ORDER BY datname",
-        ])
+        .args(["-X", "-d", "postgres", "-tA", "-c", query])
         .output()
         .map_err(|e| format!("psql: {e}"))?;
     if !out.status.success() {
         return Err(first_line(&String::from_utf8_lossy(&out.stderr)));
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| {
-            let (name, bytes) = line.split_once('|')?;
-            Some(Db {
-                name: name.to_string(),
-                bytes: bytes.trim().parse().ok()?,
-            })
-        })
-        .collect())
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn db_suffix(name: &str) -> Option<&str> {
