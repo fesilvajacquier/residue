@@ -231,24 +231,33 @@ impl WorktreeScanner {
     }
 
     pub fn fetch(&self) -> String {
-        let repos = self.repos();
-        let mut failed = Vec::new();
-        for repo in &repos {
+        let repos: Vec<PathBuf> = self
+            .repos()
+            .into_iter()
+            .filter(|r| list_worktrees(r).len() > 1)
+            .collect();
+        let failed: Vec<String> = par_map(repos.clone(), SCAN_WORKERS, |repo| {
             // Only remotes some branch tracks: a deploy remote like heroku has no readable
             // branches and would abort the whole fetch on credentials.
-            let remotes = git(repo, &["for-each-ref", "--format=%(upstream:remotename)", "refs/heads"])
+            let remotes = git(&repo, &["for-each-ref", "--format=%(upstream:remotename)", "refs/heads"])
                 .unwrap_or_default();
             let mut seen = Vec::new();
+            let mut failed = Vec::new();
             for remote in remotes.lines().filter(|r| !r.is_empty()) {
                 if seen.contains(&remote) {
                     continue;
                 }
                 seen.push(remote);
-                if git(repo, &["fetch", "--prune", "--quiet", remote]).is_none() {
-                    failed.push(format!("{}:{remote}", repo_label(repo)));
+                let args = ["fetch", "--prune", "--quiet", "--no-recurse-submodules", remote];
+                if git(&repo, &args).is_none() {
+                    failed.push(format!("{}:{remote}", repo_label(&repo)));
                 }
             }
-        }
+            failed
+        })
+        .into_iter()
+        .flatten()
+        .collect();
         if let Ok(mut cache) = self.merged_prs.lock() {
             cache.clear();
         }
@@ -565,8 +574,15 @@ fn last_touched(path: &Path) -> Option<SystemTime> {
         .max()
 }
 
-pub fn remove_worktree(repo: &Path, path: &Path) -> Result<(), String> {
-    git_checked(repo, &["worktree", "remove", "--force", &path.to_string_lossy()])
+/// Without force, git refuses a worktree that gained changes since the scan that called it safe.
+pub fn remove_worktree(repo: &Path, path: &Path, force: bool) -> Result<(), String> {
+    let path = path.to_string_lossy();
+    let mut args = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(&path);
+    git_checked(repo, &args)
 }
 
 pub fn prune_worktrees(repo: &Path) -> Result<(), String> {

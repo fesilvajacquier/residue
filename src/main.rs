@@ -23,6 +23,8 @@ struct Options {
     code_dir: PathBuf,
     idle_after: Duration,
     list_only: bool,
+    clean: bool,
+    dry_run: bool,
 }
 
 const DEFAULT_IDLE_DAYS: u64 = 15;
@@ -58,6 +60,8 @@ fn parse_options() -> Options {
         code_dir: default_code_dir(),
         idle_after: days(t3_idle_days().unwrap_or(DEFAULT_IDLE_DAYS)),
         list_only: false,
+        clean: false,
+        dry_run: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -80,12 +84,16 @@ fn parse_options() -> Options {
                 opts.idle_after = days(n);
             }
             "--list" => opts.list_only = true,
+            "--clean" => opts.clean = true,
+            "--dry-run" => opts.dry_run = true,
             "-h" | "--help" => {
                 println!(
-                    "residue [--interval SECS] [--stale-after HOURS] [--code-dir DIR] [--idle-after DAYS] [--list]"
+                    "residue [--interval SECS] [--stale-after HOURS] [--code-dir DIR] [--idle-after DAYS] [--list] [--clean [--dry-run]]"
                 );
                 println!("  --code-dir  where repos live as DIR/<org>/<repo> (default $PGWT_CODE_DIR or ~/code)");
                 println!("  --idle-after  days before a worktree with nothing of its own counts as abandoned (default: T3 Code's sidebarAutoSettleAfterDays, else {DEFAULT_IDLE_DAYS})");
+                println!("  --clean     fetch, then do what K does on every repo: remove each provably safe leftover, and exit");
+                println!("  --dry-run   with --clean, print what would be removed without touching anything");
                 println!("  --list      print servers, strays and leftover worktrees as plain text and exit");
                 std::process::exit(0);
             }
@@ -105,6 +113,9 @@ enum Message {
 
 fn main() -> std::io::Result<()> {
     let opts = parse_options();
+    if opts.clean {
+        std::process::exit(clean(opts));
+    }
     if opts.list_only {
         print_list(&Scanner::new(opts.stale_after).scan());
         print_worktrees(&WorktreeScanner::new(opts.code_dir, opts.idle_after).scan());
@@ -174,6 +185,40 @@ fn run(
         }
     }
     Ok(())
+}
+
+fn clean(opts: Options) -> i32 {
+    let started = chrono::Local::now();
+    println!("residue --clean{}  {}", if opts.dry_run { " --dry-run" } else { "" }, started.format("%Y-%m-%d %H:%M:%S"));
+    let scanner = WorktreeScanner::new(opts.code_dir, opts.idle_after);
+    println!("{}", scanner.fetch());
+    let (procs_tx, _procs_rx) = mpsc::channel();
+    let (wt_tx, _wt_rx) = mpsc::channel();
+    let mut app = App::new(procs_tx, wt_tx);
+    app.apply_snapshot(Scanner::new(opts.stale_after).scan());
+    let snapshot = scanner.scan();
+    if let Some(err) = &snapshot.db_error {
+        println!("no database info: {err}");
+    }
+    app.apply_worktrees(snapshot);
+    let items = app.safe_leftovers();
+    println!("{} safe leftover(s)", items.len());
+    for item in &items {
+        println!("  {}", item.summary.trim_end());
+        for step in &item.steps {
+            println!("      {step}");
+        }
+    }
+    if opts.dry_run || items.is_empty() {
+        return 0;
+    }
+    let (summary, errors) = app::remove_now(items);
+    for e in &errors {
+        println!("  failed: {e}");
+    }
+    let elapsed = (chrono::Local::now() - started).num_seconds();
+    println!("{summary}  ({elapsed}s)");
+    i32::from(!errors.is_empty())
 }
 
 fn print_list(snapshot: &scan::Snapshot) {
