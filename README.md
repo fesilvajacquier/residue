@@ -122,12 +122,14 @@ to T3 Code's `sidebarAutoSettleAfterDays` from `~/.t3/userdata/settings.json`, o
 which is handy from scripts or from an agent that wants to check for leftovers.
 
 `--clean` is `K` without the TUI: it fetches every repo, then removes every provably safe
-leftover across all of them (merged, abandoned, dir missing, db only; never anything held) and
+leftover across all of them (merged, abandoned, dir missing, db only; never anything held, and
+never a worktree with something still running in it, since nobody confirms what gets stopped) and
 prints each step. Add `--dry-run` to see the plan without touching anything. It exits non-zero if
 any step failed, so it can run from cron:
 
 ```cron
 PATH=/home/you/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+SSH_AUTH_SOCK=/run/user/1000/keyring/ssh
 0 3 * * * residue --clean >> ~/.local/state/residue/clean.log 2>&1
 ```
 

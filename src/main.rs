@@ -201,7 +201,17 @@ fn clean(opts: Options) -> i32 {
         println!("no database info: {err}");
     }
     app.apply_worktrees(snapshot);
-    let items = app.safe_leftovers();
+    let (busy, items): (Vec<_>, Vec<_>) = app
+        .safe_leftovers()
+        .into_iter()
+        .partition(|item| !item.kill.is_empty());
+    for item in &busy {
+        println!(
+            "skipped {}: {} process(es) running in it",
+            item.summary.trim_end(),
+            item.kill.len()
+        );
+    }
     println!("{} safe leftover(s)", items.len());
     for item in &items {
         println!("  {}", item.summary.trim_end());
